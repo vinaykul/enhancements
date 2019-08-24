@@ -36,12 +36,13 @@ superseded-by:
          * [Non-Goals](#non-goals)
       * [Proposal](#proposal)
          * [API Changes](#api-changes)
-            * [Container Restart Policy](#container-resize-policy)
+            * [Container Resize Policy](#container-resize-policy)
             * [CRI Changes](#cri-changes)
          * [Kubelet and API Server interaction](#kubelet-and-api-server-interaction)
          * [Scheduler and API Server interaction](#scheduler-and-api-server-interaction)
          * [Flow Control](#flow-control)
             * [Container resource limit update ordering](#container-resource-limit-update-ordering)
+            * [Kubelet Restart Fault Tolerance](#kubelet-restart-fault-tolerance)
             * [Notes](#notes)
          * [Affected Components](#affected-components)
          * [Possible Extensions](#possible-extensions)
@@ -57,7 +58,7 @@ in-place, without a need to restart the Pod or its Containers.
 
 The **core idea** behind the proposal is to make PodSpec mutable with regards to
 Resources, denoting **desired** resources. Additionally, PodSpec is extended to
-reflect resources **assigned** to a Pod, and PodStatus is extended to provide
+reflect resources **allocated** to a Pod, and PodStatus is extended to provide
 information about **actual** resources applied to the Pod and its Containers.
 
 This document builds upon [proposal for live and in-place vertical scaling][]
@@ -122,18 +123,18 @@ Thanks to the above:
 * Pod.Spec.Containers[i].Resources becomes purely a declaration, denoting the
   **desired** state of Pod resources,
 * Pod.Spec.Containers[i].ResourcesAllocated (new object) denotes the Node
-  resources **assigned** to the Pod and its Containers by Kubelet,
+  resources **allocated** to the Pod and its Containers,
 * Pod.Status.ContainerStatuses[i].Resources (new object) shows the **actual**
   resources held by the Pod and its Containers.
 
 A new Pod subresource named 'resourceallocation' is introduced to allow
 fine-grained access control that enables Kubelet to set or update resources
-assigned to a Pod.
+allocated to a Pod.
 
 #### Container Resize Policy
 
 To provide fine-grained user control, PodSpec.Containers is extended with
-ResizePolicy map for each resource type (CPU, memory):
+ResizePolicy map (new object) for each resource type (CPU, memory):
 * NoRestart - the default value; resize Container without restarting it,
 * RestartContainer - restart the Container in-place to apply new resource
   values. (e.g. Java process needs to change its Xmx flag)
@@ -196,66 +197,66 @@ second phase of the implementation of this feature. (not scoped for this KEP)
 ### Scheduler and API Server Interaction
 
 Scheduler observes the resize request posted to API Server, and updates the
-Node available resources accounting in its cache by using
-max(Pod.Spec.Containers[i].Resources, Pod.Status.ContainerStatuses[i].Resources)
-when computing Node resources used by the Pods. This ensures that, in the case
-of resource decrease, new Pods are not assigned prematurely to a Node that is
-in the process of being deallocated by Kubelet to resize an existing Pod.
+Node available resources accounting in its cache by using Pod's
+max(Spec.Containers[i].Resources, Status.ContainerStatuses[i].Resources) when
+computing Node resources used by the Pods. This ensures that, in the case of
+resource decrease for existing Pod, new Pod is not prematurely assigned to the
+Node that is still in the process of deallocating the resized Pod's resources.
 
 ### Flow Control
 
 The following steps denote a typical flow of an in-place resize operation for a
 Pod with ResizePolicy set to NoRestart for all its Containers.
 
-1. Initiating actor updates Pod's Containers[i].Resoursces using PATCH verb.
+1. Initiating actor updates Pod's Spec.Containers[i].Resources via PATCH verb.
 1. API Server validates the new Resources (e.g. Limits are not below
    Requests, QoS class doesn't change, ResourceQuota not exceeded..).
 1. API Server calls all Admission Controllers to verify the Pod Update.
    * If any of the Controllers reject the update, API Server responds with an
      appropriate error message.
 1. API Server updates PodSpec object with the new desired Resources.
-1. Kubelet observes that Pod's Containers[i].Resources and
-   Containers[i].ResourcesAllocated differ. It checks its Node allocatable
+1. Kubelet observes that Pod's Spec.Containers[i].Resources and
+   Spec.Containers[i].ResourcesAllocated differ. It checks its Node allocatable
    resources to determine if the new desired Resources fit the Node.
-   * _Case 1_: Kubelet finds new desired Resources fit. It accepts the
-     resize and sets Containers[i].ResourcesAllocated equal to the values of
+   * _Case 1_: Kubelet finds new desired Resources fit. It accepts the resize
+     and sets Spec.Containers[i].ResourcesAllocated equal to the values of
      Containers[i].Resources by invoking resourceallocation subresource. It
      then applies the new cgroup limits to the Pod and its Containers, and
-     once successfully done, sets Pod's ContainerStatuses[i].ResourcesAllocated
-     to reflect the desired Resources.
+     once successfully done, sets Pod's Status.ContainerStatuses[i].Resources
+     to reflect the new ResourcesAllocated values.
      - If at the same time, a new Pod was assigned to this Node against the
        capacity taken up by this resource resize, that new Pod is rejected by
        Kubelet during admission if Node has no more room.
-   * _Case 2_: Kubelet finds that the newly desired Resources does not fit.
+   * _Case 2_: Kubelet finds that the new desired Resources does not fit.
      - Kubelet checks to see if evicting lower priority Pods can successfully
        resize the Pod. If yes, it sets Containers[i].ResourcesAllocated equal
        to Containers[i].Resources by invoking resourceallocation subresource,
        and initiates pre-emption of lower priority Pods via Eviction API.
        Once lower priority Pods have been evicted, the flow continues as above.
-     - If Kubelet is unable to create enough room by evicting lower priority
-       Pods, it makes no updates, and retries the requested resize later.
-1. Scheduler, in parallel, observes that Containers[i].Resources and
-   ContainerStatuses[i].Resources differ, updates its cache, and uses
+     - If Kubelet determines that it is unable to make enough room by evicting
+       lower priority Pods, it simply retries the resize at a later time.
+1. Scheduler, in parallel, observes that Pod's Spec.Containers[i].Resources and
+   Status.ContainerStatuses[i].Resources differ, updates its cache, and uses
    max(Spec.Containers[i].Resources, Status.ContainerStatuses[i].Resources)
    when computing resources available on the Node.
    * This can temporarily result in sum of Pod resources for the Node
      exceeding Node's allocatable resources if a new Pod was assigned to that
      Node in parallel, exceeding Node capacity. This is resolved when Kubelet
      rejects that new Pod during admission due to lack of room. 
-   * After Kubelet has successfully resized the Pod, and updated
-     ContainerStatuses[i].ResourcesAllocated, Scheduler updates its cache, and
+   * After Kubelet has successfully resized the Pod and updated Pod's
+     Status.ContainerStatuses[i].Resources, Scheduler updates its cache, and
      the accounting reflects updated Pod resources.
-1. The initiating actor observes the following:
-   * _Case 1_: Spec.Containers[i].ResourcesAllocated values have changed to
-     reflect values in Spec.Containers[i].Resources, signifying that desired
-     resize has been accepted, and Pod resources is being resized. Resizing
-     is complete when Pod.Spec.Containers[i].Resources and
-     Pod.Status.ContainerStatuses[i].Resources match.
-   * _Case 2_: Spec.Containers[i].ResourcesAllocated values remain unchanged,
-     and continue to differ from desired Resources. After a certain user
-     defined timeout, the initiating actor may take alternative action.
-     For example, based on Retry policy, initiating actor (e.g VPA) may:
-     - Evict the Pod to trigger a replacement Pod with updated resources,
+1. The initiating actor (e.g. VPA) observes the following:
+   * _Case 1_: Pod's Spec.Containers[i].ResourcesAllocated values have changed
+     and matches Spec.Containers[i].Resources, signifying that desired resize
+     has been accepted, and Pod's resources are being resized. The resize
+     operation is complete when Pod's Spec.Containers[i].Resources and
+     Status.ContainerStatuses[i].Resources match.
+   * _Case 2_: Pod's Spec.Containers[i].ResourcesAllocated values remain
+     unchanged, and continues to differ from Spec.Containers[i].Resources.
+     After a certain (user defined) timeout, initiating actor may take alternate
+     action. For example, based on Retry policy, initiating actor may:
+     - Evict the Pod to trigger a replacement Pod with new desired resources,
      - Do nothing, and let Kubelet backoff and retry in-place resize.
 
 #### Container resource limit update ordering
@@ -274,13 +275,22 @@ updates resource limit for the Pod and its Containers in the following manner:
 In all the above cases, Kubelet applies Container resource limit decreases
 before applying limit increases.
 
+#### Kubelet Restart Fault Tolerance
+
+If Kubelet were to restart amidst handling Pod resize, then upon start up, all
+existing (and new Pods, if any) are handled by Kubelet as new Pod additions. If
+a Pod resize was being handled at time of restart, or other Pod resize requests
+arrive during the time Kubelet is offline, then the Pods needing resize (i.e
+Spec.Containers[i].Resources and Spec.Containers[i].ResourcesAllocated differ)
+are ordered by the Pod's ResourceVersion to ensure first-come-first-serve.
+
 #### Notes
 
 * If CPU Manager policy for a Node is set to 'static', then only integral
   values of CPU resize are allowed.
 * To avoid races and possible gamification, all components will use
-  max(ResourceRequirements, ResourcesAllocated) when computing resources used
-  by a Pod.
+  max(Spec.Containers[i].Resources, Status.ContainerStatuses[i].Resources)
+  when computing resources used by a Pod.
 * If additional resize requests arrive when a Pod is being resized, those
   requests are handled after completion of the resize that is in progress. And
   resize is driven towards the latest desired state.
@@ -288,7 +298,7 @@ before applying limit increases.
   priority Pods. Pre-emption by Kubelet is simpler, and has lower latencies.
 * Lowering memory limits may not always work if the application is holding on
   to pages. Kubelet will use a control loop to set the memory limits near usage
-  in order to force a reclaim, and update ContainerStatus.ResourcesAllocated
+  in order to force a reclaim, and update Status.ContainerStatuses[i].Resources
   only when limit is at desired value.
 * Impact of Pod Overhead: Kubelet adds Pod Overhead to the resize request to
   determine if in-place resize is possible.
@@ -303,20 +313,22 @@ Pod v1 core API:
 
 Admission Controllers: LimitRanger, ResourceQuota need to support Pod Updates:
 * for ResourceQuota it should be enough to change podEvaluator.Handler
-  implementation to allow Pod updates; max(ResourceRequirements,
-  ResourcesAllocated) should be used to be in line with current ResourceQuota
-  behavior which blocks resources before they are used (e.g. for Pending Pods),
+  implementation to allow Pod updates; max(Spec.Containers[i].Resources,
+  Status.ContainerStatuses[i].Resources) should be used to be in line with
+  current ResourceQuota behavior which blocks resources before they are used
+  (e.g. for Pending Pods),
 * for LimitRanger TBD.
 
 Kubelet:
 * support in-place resource resize,
-* set Pod's ContainerStatus.ResourcesAllocated for Containers on placing the
-  Pod on Node,
+* set Pod's Status.ContainerStatuses[i].Resources for Containers on placing
+  the Pod on Node,
 * change UpdateContainerResources CRI API to work for both Linux & Windows,
 * invoke eviction API for lower priorty Pods. (Implemented in phase 2)
 
 Scheduler:
-* update cache using max(ResourceRequirements, ResourcesAllocated).
+* update cache using Pod's max(Spec.Containers[i].Resources,
+  Status.ContainerStatuses[i].Resources).
 
 Controllers:
 * propagate Template resources update to running Pod instances.
